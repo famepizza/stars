@@ -14,18 +14,18 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiohttp import web
 
 # ---------- НАСТРОЙКИ ----------
-BOT_TOKEN = "8626601846:AAHs58MoX6NIRnyXniKQyGbC2RwmquA0KZo"
-ADMIN_IDS = [6025640928]  # Ваш ID
-ADMIN_USERNAME = "@i_god_world"  # Ваш юзернейм
+BOT_TOKEN = "8733133714:AAFG5g1MFA_q6gAvSFtj2vbhOosxcfrJ2SI"
+ADMIN_IDS = [8356674232]  # Ваш ID
+ADMIN_USERNAME = "@Gabarovv"  # Ваш юзернейм
 
-STAR_RATE_RUB = Decimal("1.33")
+STAR_RATE_RUB = Decimal("1.4")
 MIN_STARS = 50
 
-MANUAL_PAYMENT_PHONE = "+79288412075"
-MANUAL_PAYMENT_NAME = "Михаил"
+MANUAL_PAYMENT_PHONE = "+79026674703"
+MANUAL_PAYMENT_NAME = "кирилл"
 MANUAL_PAYMENT_BANK = "Озон Банк"
 
-CRYPTO_WALLET_ADDRESS = "UQDTw4S22yM6FK-o4r0_iy_xrA-HZl9PjHSGH5_vFd6GwoCQ"
+CRYPTO_WALLET_ADDRESS = "UQDL9Eo8eKPkBpsNY1KoUjYXu23dGmsfDTJnFG_1GgqcetDf"
 CRYPTO_WALLET_NETWORK = "TON"
 
 DATABASE_PATH = "bot.db"
