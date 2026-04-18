@@ -26,8 +26,8 @@ ADMIN_USERNAME = "@Gabarovv"
 
 STAR_RATE_RUB = Decimal("1.4")
 MIN_STARS = 50
-MAX_STARS = 100000  # Добавлено: ограничение максимума
-MAX_ORDER_AMOUNT = 500000  # Максимальная сумма заказа в рублях
+MAX_STARS = 100000
+MAX_ORDER_AMOUNT = 500000
 
 MANUAL_PAYMENT_PHONE = "+79026674703"
 MANUAL_PAYMENT_NAME = "кирилл"
@@ -40,8 +40,8 @@ DATABASE_PATH = "bot.db"
 
 # Rate limiting
 RATE_LIMIT = {
-    "orders_per_hour": 10,  # Максимум заказов в час
-    "proofs_per_hour": 5,   # Максимум чеков в час
+    "orders_per_hour": 10,
+    "proofs_per_hour": 5,
 }
 
 logging.basicConfig(
@@ -63,7 +63,6 @@ def check_rate_limit(user_id: int, action: str) -> bool:
     now = datetime.now()
     key = f"{user_id}:{action}"
     
-    # Очищаем старые записи (старше часа)
     rate_limit_storage[key] = [
         ts for ts in rate_limit_storage[key] 
         if now - ts < timedelta(hours=1)
@@ -77,61 +76,20 @@ def check_rate_limit(user_id: int, action: str) -> bool:
     rate_limit_storage[key].append(now)
     return True
 
-# -------------------- Улучшенная работа с БД (пул соединений) --------------------
-class DatabasePool:
-    def __init__(self, db_path: str, pool_size: int = 5):
-        self.db_path = db_path
-        self.pool_size = pool_size
-        self._pool = []
-        self._in_use = set()
-    
-    async def get_connection(self):
-        """Получить соединение из пула"""
-        for conn in self._pool:
-            if conn not in self._in_use:
-                self._in_use.add(conn)
-                return conn
-        
-        if len(self._pool) < self.pool_size:
-            conn = await aiosqlite.connect(self.db_path)
-            conn.row_factory = aiosqlite.Row
-            self._pool.append(conn)
-            self._in_use.add(conn)
-            return conn
-        
-        # Если все заняты, создаём временное
-        conn = await aiosqlite.connect(self.db_path)
-        conn.row_factory = aiosqlite.Row
-        return conn
-    
-    async def release_connection(self, conn):
-        """Вернуть соединение в пул"""
-        if conn in self._in_use:
-            self._in_use.remove(conn)
-    
-    @asynccontextmanager
-    async def transaction(self):
-        """Контекстный менеджер для транзакций"""
-        conn = await self.get_connection()
-        try:
-            async with conn:
-                yield conn
-        finally:
-            await self.release_connection(conn)
-    
-    async def close_all(self):
-        """Закрыть все соединения"""
-        for conn in self._pool:
-            await conn.close()
-        self._pool.clear()
-        self._in_use.clear()
+# -------------------- Простая работа с БД (без сложного пула) --------------------
+@asynccontextmanager
+async def get_db():
+    """Контекстный менеджер для подключения к БД"""
+    conn = await aiosqlite.connect(DATABASE_PATH)
+    conn.row_factory = aiosqlite.Row
+    try:
+        yield conn
+    finally:
+        await conn.close()
 
-db_pool = DatabasePool(DATABASE_PATH)
-
-# -------------------- Улучшенная инициализация БД --------------------
 async def init_db():
-    async with db_pool.transaction() as db:
-        # Таблица users
+    """Инициализация базы данных"""
+    async with get_db() as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -145,7 +103,6 @@ async def init_db():
             )
         """)
         
-        # Таблица orders
         await db.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,7 +125,6 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_balance ON users(stars_balance)")
         
-        # Таблица для логов действий
         await db.execute("""
             CREATE TABLE IF NOT EXISTS action_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,40 +134,49 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        await db.commit()
 
 # -------------------- Вспомогательные функции --------------------
 async def log_action(user_id: int, action: str, details: str = None):
     """Логирование действий пользователя"""
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         await db.execute(
             "INSERT INTO action_logs (user_id, action, details) VALUES (?, ?, ?)",
             (user_id, action, details)
         )
+        await db.commit()
 
 async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
 async def create_user(user_id: int, username: str = None, full_name: str = None):
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
             (user_id, username, full_name),
         )
+        await db.commit()
 
 async def update_user_balance(user_id: int, stars_add: int):
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE users SET stars_balance = stars_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
             (stars_add, user_id),
         )
-        # Обновляем статистику при подтверждении заказа
+        await db.commit()
+
+async def update_user_stats(user_id: int, amount: int):
+    """Обновление статистики пользователя"""
+    async with get_db() as db:
         await db.execute(
-            "UPDATE users SET total_orders = total_orders + 1 WHERE user_id = ?",
-            (user_id,)
+            "UPDATE users SET total_orders = total_orders + 1, total_spent = total_spent + ? WHERE user_id = ?",
+            (amount, user_id)
         )
+        await db.commit()
 
 async def create_order(
     user_id: int,
@@ -220,7 +185,7 @@ async def create_order(
     amount_rub: int,
     payment_method: str,
 ) -> int:
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         cursor = await db.execute(
             """
             INSERT INTO orders (user_id, username, package_stars, amount_rub, payment_method, status)
@@ -228,10 +193,11 @@ async def create_order(
             """,
             (user_id, username, package_stars, amount_rub, payment_method, "pending"),
         )
+        await db.commit()
         return cursor.lastrowid
 
 async def update_order_status(order_id: int, status: str, admin_message_id: int = None):
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         if admin_message_id:
             await db.execute(
                 "UPDATE orders SET status = ?, admin_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -242,15 +208,16 @@ async def update_order_status(order_id: int, status: str, admin_message_id: int 
                 "UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (status, order_id),
             )
+        await db.commit()
 
 async def get_order(order_id: int) -> Optional[Dict[str, Any]]:
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         async with db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
 async def get_pending_orders() -> List[Dict[str, Any]]:
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         async with db.execute(
             "SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at DESC"
         ) as cursor:
@@ -259,7 +226,7 @@ async def get_pending_orders() -> List[Dict[str, Any]]:
 
 async def get_user_active_orders(user_id: int) -> List[Dict[str, Any]]:
     """Получить активные (pending) заказы пользователя"""
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         async with db.execute(
             "SELECT * FROM orders WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC",
             (user_id,)
@@ -267,13 +234,14 @@ async def get_user_active_orders(user_id: int) -> List[Dict[str, Any]]:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
-async def update_user_total_spent(user_id: int, amount: int):
-    """Обновить общую сумму потраченных средств"""
-    async with db_pool.transaction() as db:
+async def update_order_proof_hash(order_id: int, proof_hash: str):
+    """Обновить хеш чека в заказе"""
+    async with get_db() as db:
         await db.execute(
-            "UPDATE users SET total_spent = total_spent + ? WHERE user_id = ?",
-            (amount, user_id)
+            "UPDATE orders SET proof_hash = ? WHERE id = ?",
+            (proof_hash, order_id)
         )
+        await db.commit()
 
 # -------------------- Валидация --------------------
 def validate_stars_amount(stars: int) -> tuple[bool, str]:
@@ -294,13 +262,12 @@ def validate_payment_proof(message: Message) -> tuple[bool, str]:
     if not (message.photo or message.document):
         return False, "Пожалуйста, отправьте фото или документ"
     
-    # Проверка rate limit
     if not check_rate_limit(message.from_user.id, "proofs"):
         return False, "❌ Слишком много запросов. Подождите час перед отправкой нового чека."
     
     return True, ""
 
-# -------------------- Клавиатуры (оставляем без изменений) --------------------
+# -------------------- Клавиатуры --------------------
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🛒 Купить звёзды", callback_data="buy_stars")
@@ -387,7 +354,6 @@ async def cmd_start(message: Message):
     )
     await log_action(message.from_user.id, "start", "User started bot")
     
-    # Проверка на активные заказы
     active_orders = await get_user_active_orders(message.from_user.id)
     active_warning = ""
     if active_orders:
@@ -458,7 +424,6 @@ async def show_help(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "buy_stars")
 async def buy_stars(callback: CallbackQuery, state: FSMContext):
-    # Проверка rate limit на создание заказов
     if not check_rate_limit(callback.from_user.id, "orders"):
         await callback.answer("❌ Слишком много заказов. Подождите час.", show_alert=True)
         return
@@ -507,7 +472,6 @@ async def custom_amount_start(callback: CallbackQuery, state: FSMContext):
 async def process_custom_amount(message: Message, state: FSMContext):
     stars = int(message.text)
     
-    # Валидация
     is_valid, error_msg = validate_stars_amount(stars)
     if not is_valid:
         await message.answer(
@@ -576,7 +540,6 @@ async def payment_selected(callback: CallbackQuery, state: FSMContext):
     username = callback.from_user.username or f"user{callback.from_user.id}"
     user_mention = f"@{username}" if callback.from_user.username else f"[Пользователь](tg://user?id={callback.from_user.id})"
     
-    # Проверка на дублирование заказа
     active_orders = await get_user_active_orders(callback.from_user.id)
     if len(active_orders) >= 5:
         await callback.answer("❌ У вас слишком много активных заказов. Дождитесь обработки предыдущих.", show_alert=True)
@@ -609,7 +572,7 @@ async def payment_selected(callback: CallbackQuery, state: FSMContext):
             f"⏱ Заказ действителен 24 часа"
         )
         
-    else:  # pay_manual
+    else:
         order_id = await create_order(
             user_id=callback.from_user.id,
             username=username,
@@ -644,7 +607,6 @@ async def payment_selected(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     
-    # Уведомление админов
     admin_text = (
         f"🔔 <b>Новый заказ #{order_id}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -664,10 +626,9 @@ async def payment_selected(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer("✅ Заказ создан! Оплатите по реквизитам и отправьте чек.", show_alert=True)
 
-# -------------------- Обработка чеков (улучшенная) --------------------
+# -------------------- Обработка чеков --------------------
 @dp.message(F.photo | F.document)
 async def handle_payment_proof(message: Message):
-    # Валидация
     is_valid, error_msg = validate_payment_proof(message)
     if not is_valid:
         await message.answer(error_msg, reply_markup=main_menu_keyboard())
@@ -677,7 +638,6 @@ async def handle_payment_proof(message: Message):
     username = message.from_user.username or f"user{user_id}"
     user_mention = f"@{username}" if message.from_user.username else f"[Пользователь](tg://user?id={user_id})"
     
-    # Поиск активного заказа
     active_orders = await get_user_active_orders(user_id)
     
     if not active_orders:
@@ -688,10 +648,9 @@ async def handle_payment_proof(message: Message):
         )
         return
     
-    # Если несколько активных заказов - предлагаем выбрать
     if len(active_orders) > 1:
         builder = InlineKeyboardBuilder()
-        for order in active_orders[:5]:  # Максимум 5
+        for order in active_orders[:5]:
             builder.button(
                 text=f"Заказ #{order['id']} - {order['package_stars']}⭐",
                 callback_data=f"select_order_{order['id']}"
@@ -703,7 +662,7 @@ async def handle_payment_proof(message: Message):
             f"Пожалуйста, выберите, к какому заказу относится этот чек:",
             reply_markup=builder.as_markup()
         )
-        # Сохраняем медиа во временное хранилище
+        
         await dp.storage.update_data(
             chat_id=message.chat.id,
             user_id=user_id,
@@ -712,7 +671,6 @@ async def handle_payment_proof(message: Message):
         )
         return
     
-    # Если один активный заказ
     order = active_orders[0]
     await process_proof_for_order(message, order, user_mention)
 
@@ -725,7 +683,6 @@ async def select_order_for_proof(callback: CallbackQuery):
         await callback.answer("❌ Заказ не найден или уже обработан", show_alert=True)
         return
     
-    # Получаем сохранённое медиа
     user_data = await dp.storage.get_data(chat_id=callback.message.chat.id, user_id=callback.from_user.id)
     if "pending_proof" not in user_data:
         await callback.answer("❌ Ошибка: чек не найден. Отправьте чек заново.", show_alert=True)
@@ -733,7 +690,6 @@ async def select_order_for_proof(callback: CallbackQuery):
     
     user_mention = f"@{callback.from_user.username}" if callback.from_user.username else f"[Пользователь](tg://user?id={callback.from_user.id})"
     
-    # Создаём "фейковое" сообщение для обработки
     class FakeMessage:
         def __init__(self, file_id, is_photo, chat_id, from_user):
             self.photo = [types.PhotoSize(file_id=file_id, width=0, height=0)] if is_photo else None
@@ -752,10 +708,8 @@ async def select_order_for_proof(callback: CallbackQuery):
     await callback.answer()
 
 async def process_proof_for_order(message, order: Dict, user_mention: str):
-    """Обработка чека для конкретного заказа"""
     order_id = order["id"]
     
-    # Проверка на повторную отправку чека для этого заказа
     if order.get("proof_hash"):
         await message.answer(
             f"⚠️ Для заказа #{order_id} уже был отправлен чек.\n"
@@ -764,13 +718,8 @@ async def process_proof_for_order(message, order: Dict, user_mention: str):
         )
         return
     
-    # Сохраняем хеш чека для предотвращения дублирования
     proof_hash = hashlib.md5(f"{order_id}{message.photo[-1].file_id if message.photo else message.document.file_id}{datetime.now()}".encode()).hexdigest()
-    async with db_pool.transaction() as db:
-        await db.execute(
-            "UPDATE orders SET proof_hash = ? WHERE id = ?",
-            (proof_hash, order_id)
-        )
+    await update_order_proof_hash(order_id, proof_hash)
     
     caption = (
         f"📎 <b>Чек к заказу #{order_id}</b>\n"
@@ -782,7 +731,6 @@ async def process_proof_for_order(message, order: Dict, user_mention: str):
         f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
     )
     
-    # Отправляем админам
     for admin_id in ADMIN_IDS:
         try:
             if message.photo:
@@ -820,11 +768,9 @@ async def process_proof_for_order(message, order: Dict, user_mention: str):
 
 @dp.message(F.text)
 async def handle_text_messages(message: Message):
-    """Обработка текстовых сообщений (чек, оплата и т.д.)"""
     text_lower = message.text.lower()
     
     if any(word in text_lower for word in ["чек", "оплат", "квитанц", "скриншот"]):
-        # Проверка, есть ли активные заказы
         active_orders = await get_user_active_orders(message.from_user.id)
         if active_orders:
             await message.answer(
@@ -844,7 +790,7 @@ async def handle_text_messages(message: Message):
                 reply_markup=main_menu_keyboard()
             )
 
-# -------------------- Админ-панель (улучшенная) --------------------
+# -------------------- Админ-панель --------------------
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -878,7 +824,7 @@ async def admin_orders_list(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         async with db.execute(
             "SELECT * FROM orders ORDER BY created_at DESC LIMIT 30"
         ) as cursor:
@@ -898,7 +844,6 @@ async def admin_orders_list(message: Message):
             f"   📅 {order['created_at'][:16]}\n\n"
         )
     
-    # Разбиваем на части, если текст слишком длинный
     if len(text) > 4000:
         for i in range(0, len(text), 4000):
             await message.answer(text[i:i+4000], parse_mode="HTML")
@@ -918,7 +863,6 @@ async def admin_pending_orders(message: Message):
     
     await message.answer(f"⏳ <b>Заказов в ожидании: {len(orders)}</b>\n\nДля подтверждения используйте кнопки под чеком.", parse_mode="HTML")
     
-    # Отправляем первые 5 для избежания спама
     for order in orders[:5]:
         user_mention = f"@{order['username']}" if order['username'] else f"[Пользователь](tg://user?id={order['user_id']})"
         text = (
@@ -958,13 +902,11 @@ async def confirm_order(callback: CallbackQuery):
         await callback.answer(f"❌ Заказ уже {status_text}", show_alert=True)
         return
     
-    # Подтверждаем заказ
     await update_order_status(order_id, "paid")
     await update_user_balance(order["user_id"], order["package_stars"])
-    await update_user_total_spent(order["user_id"], order["amount_rub"])
+    await update_user_stats(order["user_id"], order["amount_rub"])
     await log_action(order["user_id"], "order_confirmed", f"Order #{order_id}")
     
-    # Уведомляем пользователя
     try:
         await bot.send_message(
             order["user_id"],
@@ -978,7 +920,6 @@ async def confirm_order(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Failed to notify user {order['user_id']}: {e}")
     
-    # Обновляем сообщение админа
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply(f"✅ Заказ #{order_id} подтверждён, звёзды начислены!")
@@ -1007,7 +948,6 @@ async def reject_order(callback: CallbackQuery):
     await update_order_status(order_id, "rejected")
     await log_action(order["user_id"], "order_rejected", f"Order #{order_id}")
     
-    # Уведомляем пользователя
     try:
         await bot.send_message(
             order["user_id"],
@@ -1035,12 +975,13 @@ async def cleanup_old_orders(message: Message):
     
     cutoff_date = datetime.now() - timedelta(days=30)
     
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         result = await db.execute(
             "DELETE FROM orders WHERE status IN ('paid', 'rejected') AND created_at < ?",
             (cutoff_date.isoformat(),)
         )
         deleted_count = result.rowcount
+        await db.commit()
     
     await message.answer(f"🗑 Удалено старых заказов: {deleted_count}")
 
@@ -1073,8 +1014,7 @@ async def broadcast_send(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     
-    # Получаем всех пользователей
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
             users = await cursor.fetchall()
     
@@ -1093,7 +1033,6 @@ async def broadcast_send(message: Message, state: FSMContext):
             )
             success += 1
             
-            # Обновляем статус каждые 50 сообщений
             if i % 50 == 0 and i > 0:
                 await status_msg.edit_text(
                     f"📤 Рассылка в процессе...\n"
@@ -1102,7 +1041,7 @@ async def broadcast_send(message: Message, state: FSMContext):
                     f"📊 Прогресс: {i}/{len(users)}"
                 )
             
-            await asyncio.sleep(0.05)  # Защита от блокировки
+            await asyncio.sleep(0.05)
             
         except Exception as e:
             failed += 1
@@ -1124,7 +1063,7 @@ async def admin_stats(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     
-    async with db_pool.transaction() as db:
+    async with get_db() as db:
         async with db.execute("SELECT COUNT(*) as count FROM users") as cursor:
             users_count = (await cursor.fetchone())['count']
         
@@ -1143,7 +1082,6 @@ async def admin_stats(message: Message):
         async with db.execute("SELECT AVG(amount_rub) as avg FROM orders WHERE status = 'paid'") as cursor:
             avg_order = (await cursor.fetchone())['avg'] or 0
         
-        # Заказы за последние 7 дней
         week_ago = (datetime.now() - timedelta(days=7)).isoformat()
         async with db.execute(
             "SELECT COUNT(*) as count FROM orders WHERE status = 'paid' AND created_at > ?",
@@ -1177,7 +1115,7 @@ async def health_check():
     
     async def stats(request):
         try:
-            async with db_pool.transaction() as db:
+            async with get_db() as db:
                 async with db.execute("SELECT COUNT(*) as count FROM users") as cursor:
                     users = (await cursor.fetchone())['count']
             return web.json_response({"status": "ok", "users": users, "timestamp": datetime.now().isoformat()})
@@ -1197,23 +1135,14 @@ async def health_check():
     while True:
         await asyncio.sleep(3600)
 
-# -------------------- Graceful shutdown --------------------
-async def shutdown():
-    logger.info("Shutting down...")
-    await db_pool.close_all()
-    await bot.session.close()
-    logger.info("Shutdown complete")
-
 # -------------------- Запуск --------------------
 async def main():
     await init_db()
     logger.info("🤖 Бот запущен!")
     logger.info(f"👑 Администратор: {ADMIN_USERNAME}")
     
-    # Запускаем health check сервер
     asyncio.create_task(health_check())
     
-    # Уведомление админам о запуске
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -1226,10 +1155,7 @@ async def main():
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
     
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await shutdown()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
